@@ -1821,7 +1821,8 @@ llvm::Value *CodeGenFunction::EmitCXXNewExpr(const CXXNewExpr *E) {
   // To not break LTO with different optimizations levels, we do it regardless
   // of optimization level.
   if (CGM.getCodeGenOpts().StrictVTablePointers &&
-      allocator->isReservedGlobalPlacementOperator())
+      allocator->isReservedGlobalPlacementOperator() &&
+      allocType.requiresBuiltinLaunder(getContext()))
     result = Builder.CreateLaunderInvariantGroup(result);
 
   // Emit sanitizer checks for pointer value now, so that in the case of an

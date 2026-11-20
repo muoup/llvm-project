@@ -5810,6 +5810,10 @@ requiresBuiltinLaunderImpl(const ASTContext &Context, QualType Ty,
   if (Record->isDynamicClass())
     return true;
 
+  for (const auto &Base : Record->bases()) {
+    if (requiresBuiltinLaunderImpl(Context, Base.getType(), Seen))
+      return true;
+  }
   for (FieldDecl *F : Record->fields()) {
     if (requiresBuiltinLaunderImpl(Context, F->getType(), Seen))
       return true;
