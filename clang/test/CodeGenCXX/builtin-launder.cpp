@@ -112,6 +112,17 @@ extern "C" void test_builtin_launder_virtual_member_depth_2(TestVirtualMemberDep
   TestVirtualMemberDepth2 *d = __builtin_launder(p);
 }
 
+struct TestInheritedVirtualMember : TestVirtualMember {};
+
+// CHECK-LABEL: define{{.*}} @test_builtin_launder_inherited_virtual_member(
+// CHECK-NONSTRICT-NOT: @llvm.launder.invariant.group
+// CHECK-STRICT: call ptr @llvm.launder.invariant.group
+// CHECK: ret ptr
+extern "C" TestInheritedVirtualMember *
+test_builtin_launder_inherited_virtual_member(TestInheritedVirtualMember *p) {
+  return __builtin_launder(p);
+}
+
 struct TestVirtualReferenceMember {
   TestVirtualFn &member;
 };

@@ -1572,6 +1572,11 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
                           .speculateUnpredictables(true)
                           .hoistLoadsStoresWithCondFaulting(true)));
 
+  if (Level == OptimizationLevel::O3 && LTOPhase == ThinOrFullLTOPhase::None) {
+    OptimizePM.addPass(MemCpyOptPass());
+    OptimizePM.addPass(InstCombinePass());
+  }
+
   // Add the core optimizing pipeline.
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(OptimizePM),
                                                 PTO.EagerlyInvalidateAnalyses));

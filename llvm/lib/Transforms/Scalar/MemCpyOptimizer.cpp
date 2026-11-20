@@ -15,6 +15,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/iterator_range.h"
@@ -25,6 +26,7 @@
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/Loads.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/MemorySSAUpdater.h"
@@ -101,6 +103,15 @@ struct MemsetRange {
 
   bool isProfitableToUseMemset(const DataLayout &DL) const;
 };
+
+struct HeapCopyStore {
+  uint64_t Offset;
+  ConstantInt *Value;
+};
+
+constexpr unsigned MaxHeapCopyBytes = 32;
+constexpr unsigned MaxHeapCopyUses = 24;
+constexpr unsigned MaxHeapCopyScan = 64;
 
 } // end anonymous namespace
 
@@ -1792,6 +1803,113 @@ static bool isZeroSize(Value *Size) {
   return false;
 }
 
+static bool collectHeapCopyStores(Instruction &Read, Value *Src, uint64_t Size,
+                                  uint64_t DestOffset, bool AllowTransfer,
+                                  SmallVectorImpl<HeapCopyStore> &Plan,
+                                  const TargetLibraryInfo &TLI,
+                                  BatchAAResults &BAA, DominatorTree &DT) {
+  const DataLayout &DL = Read.getDataLayout();
+  auto *Alloc = dyn_cast<CallInst>(Src);
+  if (!Alloc || !Alloc->hasRetAttr(Attribute::NoAlias) ||
+      Alloc->getParent() != Read.getParent() || !Alloc->comesBefore(&Read) ||
+      !isRemovableAlloc(Alloc, &TLI))
+    return false;
+
+  auto Family = getAllocationFamily(Alloc, &TLI);
+  auto AllocSize = getAllocSize(Alloc, &TLI);
+  if (!Family || !AllocSize || *AllocSize != Size)
+    return false;
+
+  SmallVector<Value *, 4> Pointers{Alloc};
+  SmallPtrSet<StoreInst *, 8> Stores;
+  CallInst *Free = nullptr;
+  unsigned UseCount = 0;
+  for (unsigned I = 0; I < Pointers.size(); ++I) {
+    Value *Ptr = Pointers[I];
+    for (Use &U : Ptr->uses()) {
+      auto *User = dyn_cast<Instruction>(U.getUser());
+      if (++UseCount > MaxHeapCopyUses || !User ||
+          User->getParent() != Read.getParent())
+        return false;
+      if (User == &Read) {
+        if (auto *Copy = dyn_cast<MemCpyInst>(&Read))
+          if (!Copy->isArgOperand(&U) || Copy->getArgOperandNo(&U) != 1)
+            return false;
+        continue;
+      }
+      if (auto *GEP = dyn_cast<GetElementPtrInst>(User)) {
+        if (!GEP->isInBounds() || !GEP->hasAllConstantIndices())
+          return false;
+        Pointers.push_back(GEP);
+        continue;
+      }
+      if (auto *Store = dyn_cast<StoreInst>(User)) {
+        if (U.getOperandNo() != StoreInst::getPointerOperandIndex() ||
+            !Store->isSimple() || !Store->comesBefore(&Read) ||
+            Store->getMetadata(LLVMContext::MD_nontemporal))
+          return false;
+        Stores.insert(Store);
+        continue;
+      }
+      auto *Call = dyn_cast<CallInst>(User);
+      if (Free || Ptr != Alloc || !Call || Call->arg_empty() ||
+          &U != &Call->getArgOperandUse(0) || !Read.comesBefore(Call) ||
+          getFreedOperand(Call, &TLI) != Alloc ||
+          getAllocationFamily(Call, &TLI) != Family)
+        return false;
+      Free = Call;
+    }
+  }
+  if (!Free)
+    return false;
+
+  MemoryLocation Loc(Src, LocationSize::precise(Size));
+  unsigned Scanned = 0;
+  uint64_t Written = 0;
+  for (Instruction *I = Read.getPrevNode(); I != Alloc; I = I->getPrevNode()) {
+    if (++Scanned > MaxHeapCopyScan)
+      return false;
+    auto *Store = dyn_cast<StoreInst>(I);
+    if (!Store || !Stores.contains(Store)) {
+      if (I->mayWriteToMemory() && isModSet(BAA.getModRefInfo(I, Loc)) &&
+          isModSet(BAA.callCapturesBefore(I, Loc, &DT)))
+        return false;
+      continue;
+    }
+
+    Value *Stored = Store->getValueOperand();
+    auto *Ty = dyn_cast<IntegerType>(Stored->getType());
+    int64_t Offset = 0;
+    if (!Ty || Ty->getBitWidth() % 8 != 0 ||
+        GetPointerBaseWithConstantOffset(Store->getPointerOperand(), Offset, DL,
+                                         /*AllowNonInbounds=*/false) != Src ||
+        Offset < 0 || uint64_t(Offset) >= Size)
+      return false;
+
+    uint64_t Width = Ty->getBitWidth() / 8;
+    if (Width > Size - uint64_t(Offset))
+      return false;
+    uint64_t StoreMask = ((uint64_t(1) << Width) - 1) << Offset;
+    if (Written & StoreMask)
+      return false;
+    Written |= StoreMask;
+
+    uint64_t Target = DestOffset + uint64_t(Offset);
+    if (auto *C = dyn_cast<ConstantInt>(Stored)) {
+      Plan.push_back({Target, C});
+      continue;
+    }
+    auto *Load = dyn_cast<LoadInst>(Stored);
+    if (!AllowTransfer || !Load || !Load->isSimple() || !Load->hasOneUse() ||
+        Load->getParent() != Read.getParent() ||
+        !collectHeapCopyStores(*Load, Load->getPointerOperand(), Width, Target,
+                               /*AllowTransfer=*/false, Plan, TLI, BAA, DT))
+      return false;
+  }
+
+  return Written == (uint64_t(1) << Size) - 1;
+}
+
 /// Perform simplification of memcpy's.  If we have memcpy A
 /// which copies X to Y, and memcpy B which copies Y to Z, then we can rewrite
 /// B to be a memcpy from X to Z (or potentially a memmove, depending on
@@ -1905,12 +2023,33 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
     }
   }
 
-  // If the transfer is from a stack slot to a stack slot, then we may be able
-  // to perform the stack-move optimization. See the comments in
-  // performStackMoveOptzn() for more details.
   ConstantInt *Len = dyn_cast<ConstantInt>(M->getLength());
   if (Len == nullptr)
     return false;
+  SmallVector<HeapCopyStore, 4> Plan;
+  if (!M->hasOperandBundles() && !M->getMetadata(LLVMContext::MD_nontemporal) &&
+      Len->getValue().ule(MaxHeapCopyBytes) &&
+      collectHeapCopyStores(*M, M->getRawSource(), Len->getZExtValue(), 0,
+                            /*AllowTransfer=*/true, Plan, *TLI, BAA, *DT)) {
+    IRBuilder<> Builder(M);
+    for (const HeapCopyStore &Store : Plan) {
+      Value *Dest = Builder.CreateConstGEP1_64(Builder.getInt8Ty(),
+                                               M->getRawDest(), Store.Offset);
+      auto *NewStore = Builder.CreateAlignedStore(
+          Store.Value, Dest,
+          commonAlignment(M->getDestAlign().valueOrOne(), Store.Offset));
+      auto *NewDef = MSSAU->createMemoryAccessBefore(NewStore, nullptr, MA);
+      MSSAU->insertDef(cast<MemoryDef>(NewDef), /*RenameUses=*/true);
+    }
+    BBI = M->getNextNode()->getIterator();
+    eraseInstruction(M);
+    ++NumMemCpyInstr;
+    return true;
+  }
+
+  // If the transfer is from a stack slot to a stack slot, then we may be able
+  // to perform the stack-move optimization. See the comments in
+  // performStackMoveOptzn() for more details.
   if (performStackMoveOptzn(M, M, M->getDest(), M->getSource(),
                             TypeSize::getFixed(Len->getZExtValue()), BAA)) {
     // Avoid invalidating the iterator.
