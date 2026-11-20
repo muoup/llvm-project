@@ -30,6 +30,8 @@
 #include "llvm/Analysis/AssumeBundleQueries.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/CaptureTracking.h"
+#include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/GlobalsModRef.h"
 #include "llvm/Analysis/InstructionPrecedenceTracking.h"
@@ -71,6 +73,7 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Scalar/GVNValueTable.h"
 #include "llvm/Transforms/Utils/AssumeBundleBuilder.h"
@@ -1616,6 +1619,157 @@ static Value *findDominatingValue(const ScalarOptions &Opts,
   return nullptr;
 }
 
+static Constant *assembleFromStores(const ScalarOptions &Opts, LoadInst *Load,
+                                    Value *Address, Instruction *From,
+                                    AAResults *AA) {
+  const DataLayout &DL = Load->getDataLayout();
+  Type *LoadTy = Load->getType();
+  if (!Load->isSimple() || LoadTy->isPtrOrPtrVectorTy() ||
+      LoadTy->isAggregateType() || LoadTy->isScalableTy())
+    return nullptr;
+  uint64_t Size = DL.getTypeStoreSize(LoadTy).getFixedValue();
+  if (DL.getTypeSizeInBits(LoadTy).getFixedValue() != Size * 8 || Size == 0 ||
+      Size > 16)
+    return nullptr;
+
+  constexpr bool AllowNonInbounds = true;
+  constexpr bool AllowInvariantGroup = true;
+  int64_t LoadOff = 0;
+  Value *Base = GetPointerBaseWithConstantOffset(
+      Address, LoadOff, DL, AllowNonInbounds, AllowInvariantGroup);
+  MemoryLocation Loc = MemoryLocation::get(Load).getWithNewPtr(Address);
+  Type *ByteTy = Type::getInt8Ty(Load->getContext());
+  SmallVector<uint8_t, 16> Bytes(Size, 0);
+  uint32_t Filled = 0;
+  uint32_t AllFilled = (uint32_t(1) << Size) - 1;
+  uint32_t NumVisitedInsts = 0;
+  BatchAAResults BatchAA(*AA);
+
+  BasicBlock *FromBB = From->getParent();
+  for (BasicBlock *BB = FromBB; BB; BB = BB->getSinglePredecessor())
+    for (Instruction *I = BB == FromBB ? From : BB->getTerminator(); I;
+         I = I->getPrevNode()) {
+      if (++NumVisitedInsts > Opts.gvn_max_num_visited_insts)
+        return nullptr;
+      if (!I->mayWriteToMemory())
+        continue;
+      auto *SI = dyn_cast<StoreInst>(I);
+      int64_t StoreOff = 0;
+      if (!SI || !SI->isSimple() ||
+          GetPointerBaseWithConstantOffset(
+              SI->getPointerOperand(), StoreOff, DL, AllowNonInbounds,
+              AllowInvariantGroup) != Base) {
+        if (I == From || isModSet(BatchAA.getModRefInfo(I, Loc)))
+          return nullptr;
+        continue;
+      }
+      TypeSize StoreTS = DL.getTypeStoreSize(SI->getValueOperand()->getType());
+      if (StoreTS.isScalable())
+        return nullptr;
+      int64_t StoreSize = StoreTS.getFixedValue();
+      if (StoreOff >= LoadOff + int64_t(Size) ||
+          StoreOff + StoreSize <= LoadOff)
+        continue;
+      auto *C = dyn_cast<Constant>(SI->getValueOperand());
+      if (!C || DL.getTypeSizeInBits(C->getType()).getFixedValue() !=
+                    uint64_t(StoreSize) * 8)
+        return nullptr;
+      for (uint64_t K = 0; K != Size; ++K) {
+        int64_t Rel = LoadOff + int64_t(K) - StoreOff;
+        if (Rel < 0 || Rel >= StoreSize || (Filled & (uint32_t(1) << K)))
+          continue;
+        auto *B = dyn_cast_or_null<ConstantInt>(
+            getConstantValueForLoad(C, Rel, ByteTy, DL));
+        if (!B)
+          return nullptr;
+        Bytes[K] = B->getZExtValue();
+        Filled |= uint32_t(1) << K;
+      }
+      if (Filled == AllFilled)
+        return ConstantFoldLoadFromConst(
+            ConstantDataArray::get(Load->getContext(), Bytes), LoadTy, DL);
+    }
+  return nullptr;
+}
+
+static std::optional<AvailableValue>
+findValueCopiedByMemcpy(const ScalarOptions &Opts, LoadInst *Load,
+                        Value *Address, MemCpyInst *Copy, AAResults *AA,
+                        DominatorTree *DT) {
+  auto *Length = dyn_cast<ConstantInt>(Copy->getLength());
+  auto *LoadTy = dyn_cast<IntegerType>(Load->getType());
+  if (Copy->isVolatile() || !Load->isSimple() || !LoadTy ||
+      LoadTy->getBitWidth() % 8 != 0 || !Length ||
+      !Length->getValue().isIntN(63))
+    return std::nullopt;
+
+  const DataLayout &DL = Load->getDataLayout();
+  constexpr bool AllowNonInbounds = false;
+  constexpr bool AllowInvariantGroup = true;
+  int64_t DestOffset = 0, LoadOffset = 0;
+  Value *DestBase =
+      GetPointerBaseWithConstantOffset(Copy->getRawDest(), DestOffset, DL,
+                                       AllowNonInbounds, AllowInvariantGroup);
+  Value *LoadBase = GetPointerBaseWithConstantOffset(
+      Address, LoadOffset, DL, AllowNonInbounds, AllowInvariantGroup);
+  if (DestBase != LoadBase || LoadOffset < DestOffset)
+    return std::nullopt;
+
+  uint64_t CopyOffset = uint64_t(LoadOffset) - uint64_t(DestOffset);
+  uint64_t LoadSize = LoadTy->getBitWidth() / 8;
+  uint64_t CopySize = Length->getZExtValue();
+  if (CopyOffset > CopySize || LoadSize > CopySize - CopyOffset)
+    return std::nullopt;
+
+  int64_t SourceOffset = 0;
+  Value *SourceBase =
+      GetPointerBaseWithConstantOffset(Copy->getRawSource(), SourceOffset, DL,
+                                       AllowNonInbounds, AllowInvariantGroup);
+  if ((!isa<AllocaInst>(SourceBase) && !isNoAliasCall(SourceBase)) ||
+      AddOverflow(SourceOffset, int64_t(CopyOffset), SourceOffset))
+    return std::nullopt;
+
+  MemoryLocation SourceLoc = MemoryLocation::getForSource(Copy);
+  BatchAAResults BatchAA(*AA);
+  uint32_t NumVisitedInsts = 0;
+  for (Instruction *I = Copy->getPrevNode(); I; I = I->getPrevNode()) {
+    if (++NumVisitedInsts > Opts.gvn_max_num_visited_insts || I == SourceBase)
+      break;
+    if (!I->mayWriteToMemory())
+      continue;
+    if (auto *Store = dyn_cast<StoreInst>(I)) {
+      Value *Stored = Store->getValueOperand();
+      auto *StoreTy = dyn_cast<IntegerType>(Stored->getType());
+      int64_t StoreOffset = 0;
+      if (StoreTy && GetPointerBaseWithConstantOffset(
+                         Store->getPointerOperand(), StoreOffset, DL,
+                         AllowNonInbounds, AllowInvariantGroup) == SourceBase) {
+        if (StoreOffset > SourceOffset) {
+          if (uint64_t(StoreOffset) - uint64_t(SourceOffset) >= LoadSize)
+            continue;
+          break;
+        }
+
+        uint64_t StoreSize = DL.getTypeStoreSize(StoreTy).getFixedValue();
+        uint64_t Offset = uint64_t(SourceOffset) - uint64_t(StoreOffset);
+        if (Offset >= StoreSize)
+          continue;
+        if (!Store->isSimple() || StoreTy->getBitWidth() % 8 != 0 ||
+            LoadSize > StoreSize - Offset ||
+            capturesAnything(
+                PointerMayBeCapturedBefore(SourceBase, true, Copy, DT, false,
+                                           CaptureComponents::Provenance)))
+          break;
+        return AvailableValue::get(Stored, Offset);
+      }
+    }
+    if (isModSet(BatchAA.getModRefInfo(I, SourceLoc)) &&
+        isModSet(BatchAA.callCapturesBefore(I, SourceLoc, DT)))
+      break;
+  }
+  return std::nullopt;
+}
+
 std::optional<AvailableValue>
 GVNPassImpl::analyzeSelectAvailability(LoadInst *Load, SelectInst *Sel,
                                        Value *TrueAddr, Value *FalseAddr,
@@ -1650,16 +1804,25 @@ GVNPassImpl::analyzeLoadAvailability(LoadInst *Load, const ReachingMemVal &Dep,
 
   const DataLayout &DL = Load->getDataLayout();
   if (Dep.Kind == DepKind::Clobber) {
-    // If the dependence is to a store that writes to a superset of the bits
-    // read by the load, we can extract the bits we need for the load from the
-    // stored value.
     if (StoreInst *DepSI = dyn_cast<StoreInst>(DepInst)) {
-      // Can't forward from non-atomic to atomic without violating memory model.
-      if (Address && Load->isAtomic() <= DepSI->isAtomic()) {
-        int Offset =
-            analyzeLoadFromClobberingStore(Load->getType(), Address, DepSI, DL);
-        if (Offset != -1)
-          return AvailableValue::get(DepSI->getValueOperand(), Offset);
+      if (Address) {
+        // Can't forward from non-atomic to atomic without violating memory model.
+        if (Load->isAtomic() <= DepSI->isAtomic()) {
+          // If the dependence is to a store that writes to a superset of the bits
+          // read by the load, we can extract the bits we need for the load from the
+          // stored value.
+          int Offset =
+          analyzeLoadFromClobberingStore(Load->getType(), Address, DepSI, DL);
+          if (Offset != -1)
+            return AvailableValue::get(DepSI->getValueOperand(), Offset);
+        }
+
+        // If the dependence instead is to a store writing to a subset of the bits
+        // read by the load, we can attempt to reconstruct the value if the remaining
+        // bits are also available.
+        if (Constant *C = assembleFromStores(*Opts, Load, Address, DepSI, AA)) {
+          return AvailableValue::get(C);
+        }
       }
     }
 
@@ -1708,6 +1871,10 @@ GVNPassImpl::analyzeLoadAvailability(LoadInst *Load, const ReachingMemVal &Dep,
                                                       DepMI, DL);
         if (Offset != -1)
           return AvailableValue::getMI(DepMI, Offset);
+        if (auto *Copy = dyn_cast<MemCpyInst>(DepMI))
+          if (auto AV =
+                  findValueCopiedByMemcpy(*Opts, Load, Address, Copy, AA, DT))
+            return AV;
       }
     }
 
@@ -1737,8 +1904,12 @@ GVNPassImpl::analyzeLoadAvailability(LoadInst *Load, const ReachingMemVal &Dep,
     // different types if we have to. If the stored value is convertable to
     // the loaded value, we can reuse it.
     if (!canCoerceMustAliasedValueToLoad(S->getValueOperand(), Load->getType(),
-                                         S->getFunction()))
+                                         S->getFunction())) {
+      if (Address)
+        if (Constant *C = assembleFromStores(*Opts, Load, Address, S, AA))
+          return AvailableValue::get(C);
       return std::nullopt;
+    }
 
     // Can't forward from non-atomic to atomic without violating memory model.
     if (S->isAtomic() < Load->isAtomic())

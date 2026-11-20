@@ -363,10 +363,11 @@ LLVM_ABI Value *FindInsertedValue(
 /// creates and later unpacks the required APInt.
 inline Value *GetPointerBaseWithConstantOffset(Value *Ptr, int64_t &Offset,
                                                const DataLayout &DL,
-                                               bool AllowNonInbounds = true) {
+                                               bool AllowNonInbounds = true,
+                                               bool AllowInvariantGroup = false) {
   APInt OffsetAPInt(DL.getIndexTypeSizeInBits(Ptr->getType()), 0);
-  Value *Base =
-      Ptr->stripAndAccumulateConstantOffsets(DL, OffsetAPInt, AllowNonInbounds);
+  Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+      DL, OffsetAPInt, AllowNonInbounds, AllowInvariantGroup);
 
   std::optional<int64_t> OffsetInt64 = OffsetAPInt.trySExtValue();
   if (!OffsetInt64) {
@@ -380,9 +381,10 @@ inline Value *GetPointerBaseWithConstantOffset(Value *Ptr, int64_t &Offset,
 inline const Value *
 GetPointerBaseWithConstantOffset(const Value *Ptr, int64_t &Offset,
                                  const DataLayout &DL,
-                                 bool AllowNonInbounds = true) {
+                                 bool AllowNonInbounds = true,
+                                 bool AllowInvariantGroup = false) {
   return GetPointerBaseWithConstantOffset(const_cast<Value *>(Ptr), Offset, DL,
-                                          AllowNonInbounds);
+                                          AllowNonInbounds, AllowInvariantGroup);
 }
 
 /// Represents offset+length into a ConstantDataArray.
